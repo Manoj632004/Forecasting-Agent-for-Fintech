@@ -4,7 +4,6 @@
 
 9164 companies
 
-
 costat – company status (active, inactive, merged, etc.)
 curcdq – currency code used in the financial statements
 datafmt – format of the financial data (standard, industrial, etc.)
