@@ -2,3 +2,12 @@ data/compustat.csv
 data/crisp indices.csv
 data/crisp treasury and inflation.csv
 result/forecast_report.md
+processed_data/y_test.csv
+.gitignore
+processed_data/X_val.csv
+processed_data/X_test.csv
+processed_data/X_train.csv
+processed_data/y_train.csv
+processed_data/y_val.csv
+data/MEDCPI_US.csv
+data/combined_quarterly_data.csv
