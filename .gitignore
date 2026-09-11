@@ -13,3 +13,12 @@ data/MEDCPI_US.csv
 data/combined_quarterly_data.csv
 bin/
 forecasting/catboost_info
+data/processed_data/X_test.csv
+data/processed_data/y_test.csv
+data/processed_data/y_train.csv
+data/processed_data/X_train.csv
+Agentic System/result/forecast_report.md
+data/macro/combined_quatarly_macro_data.csv
+data/macro/volatility_dataset_daily2.csv
+data/macro/CRSP Stocks.csv
+temp/
