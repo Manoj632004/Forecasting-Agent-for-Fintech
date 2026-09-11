@@ -1,4 +1,9 @@
 # Fintech Agent
+venv at venv C:\venvs\fintech\Scripts\python.exe   
+C:\venvs\fintech\Scripts\python.exe -m pip install ipykernel  - changing path to python
+C:\venvs\fintech\Scripts\python.exe -m ipykernel install --user --name fintech --display-name "Python (Fintech)"
+
+
 
 ### Compustat dataset information:
 
