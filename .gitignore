@@ -1,2 +1,4 @@
-src/sample input data
 temp/
+.env
+venv/
+results/
