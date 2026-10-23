@@ -1,0 +1,4 @@
+# Visualization role
+Purpose: present saved evidence accurately. Inputs: predictions, metrics and transformation metadata. Outputs: the existing HTML report and summary JSON. This stage currently uses deterministic Python rendering rather than a language-model agent.
+Label time axes, target units and prediction type. Distinguish backtest actuals/predictions from future forecasts; do not label the final test prediction as an upcoming future value. Show intervals only when actually computed. Identify transformed target scales. Keep actual and prediction dates aligned and disclose missing observations.
+Model comparisons must share evaluation dates, horizon, target scale and metric definition. Lowest test RMSE is a descriptive comparison, not an unbiased model-selection procedure. Feature importance is model-specific and does not establish causation. Preserve failures and limitations rather than hiding poor performance with chart ranges.

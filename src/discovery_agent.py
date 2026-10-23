@@ -2,7 +2,7 @@
 Discovery Agent
 ===============
 
-Infers the structure, quality and statistical properties of a financial
+Infers the structure, quality and statistical properties of a 
 time-series dataset and produces a single JSON hand-off document that the
 preprocessing agent consumes.
 
@@ -14,10 +14,11 @@ Tools exposed to the LLM
 4. correlation_tool        -- correlations, multicollinearity, feature ranking
 
 The final agent answer is a JSON object (see DISCOVERY_PROMPT for the schema).
-
-NOTE: the agent itself is INVOKED from orchestrator_agent.py, not here.
 """
-
+from rag import get_knowledge
+from knowledge import load_guidance
+from run_store import create_run_dir, get_run_dir
+from pathlib import Path
 import json
 import os
 import warnings
@@ -27,25 +28,24 @@ import pandas as pd
 from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
-from langchain_ollama import ChatOllama
+from model_config import build_chat_model
+from typing import Union
+from statsmodels.tsa.stattools import adfuller
 
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3.1:8b"          # NOTE: notebook version had a trailing space
-
-# Guard-rails so a 200-column dataset does not blow up the context window
-MAX_READ_COLUMNS = 200         # columns listed by read_data_tool before truncating
+MAX_READ_COLUMNS = 100         # columns listed by read_data_tool before truncating
 MAX_SAMPLE_ROWS = 3
 MAX_CORR_COLUMNS = 60          # numeric columns considered by correlation_tool
 MAX_STATIONARITY_COLUMNS = 40  # numeric columns ADF-tested
 MAX_STATS_COLUMNS = 100        # numeric columns described by data_quality_tool
 MIN_OBS_FOR_STATS = 20         # minimum non-NaN observations to run a test
-
-llm = ChatOllama(model=MODEL, temperature=0)
-
+COV_KEEP_PCT = 95.0        # >= this share of the target period covered -> effectively complete
+COV_MIN_PCT = 30.0         # <  this share covered -> too sparse to impute reliably
+COV_IMPORTANT_CORR = 0.5   # |corr with target| on the overlap needed to call a column important
+MAX_COV_COLUMNS = 100      # feature columns analysed
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -157,16 +157,13 @@ def _detect_metadata_header_rows(df: pd.DataFrame) -> dict:
 
     # A categorical-only dataset is not a metadata header -- require that
     # real numeric rows actually appear below the candidate block.
-    looks_like_data_below = any(
-        numeric_ratio(i) >= 0.5 for i in range(header_rows, min(header_rows + 3, len(df)))
-    )
-
+    looks_like_data_below = any(numeric_ratio(i) >= 0.5 for i in range(header_rows, min(header_rows + 3, len(df))))
+    detected = header_rows > 0 and looks_like_data_below
     return {
-        "detected": header_rows > 0 and looks_like_data_below,
-        "header_rows": header_rows if looks_like_data_below else 0,
+        "detected": detected,
+        "header_rows": header_rows if detected else 0,
         "first_row_values": [str(v) for v in df.iloc[0][probe_cols].tolist()[:5]],
     }
-
 
 def _looks_like_id(series: pd.Series) -> bool:
     """Unique-per-row, sequential, or name-hinted identifier columns."""
@@ -180,7 +177,6 @@ def _looks_like_id(series: pd.Series) -> bool:
     if non_null.is_unique and len(non_null) == len(series) and series.dtype == "object":
         return True
     return False
-
 
 def _outlier_counts(series: pd.Series) -> dict:
     """IQR and z-score outlier counts for one numeric column."""
@@ -202,6 +198,151 @@ def _outlier_counts(series: pd.Series) -> dict:
     return {"iqr_outliers": iqr_out, "zscore_outliers": z_out}
 
 
+def _parse_dates(s: pd.Series) -> pd.Series:
+    """Strings -> datetime (unparseable -> NaT).  Plain 4-digit numbers are treated as years."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if pd.api.types.is_numeric_dtype(s):
+            years = pd.to_numeric(s, errors="coerce")
+            years = years.where(years.between(1000, 2999)).round().astype("Int64").astype(str)
+            return pd.to_datetime(years, format="%Y", errors="coerce")
+        try:
+            return pd.to_datetime(s, errors="coerce", format="mixed")
+        except (TypeError, ValueError):            # older pandas without format="mixed"
+            return pd.to_datetime(s, errors="coerce")
+
+
+def _find_date_col(df: pd.DataFrame) -> str:
+    """First text / date-named column whose values mostly parse as dates."""
+    hints = ("date", "time", "period", "month", "year", "quarter")
+    for c in df.columns:
+        if df[c].dtype == "object" or any(h in str(c).lower() for h in hints):
+            sample = df[c].dropna().head(200)
+            if len(sample) and _parse_dates(sample).notna().mean() >= 0.8:
+                return c
+    return ""
+
+
+def _coverage_analysis(df: pd.DataFrame, date_col: str = "", target_col: str = "") -> dict:
+    """
+    Compare every column's time coverage with the target's.
+
+    For each numeric column: first/last valid date, how much of the TARGET period it
+    covers, how many target rows would be lost if the column were kept (trim), where the
+    gaps are (before its start / after its end / inside), correlation with the target on
+    the overlapping rows (importance), and a suggested action:
+
+        keep         fully covers the target period        (listed in fully_covered_columns)
+        impute       >= COV_KEEP_PCT covered, or important with mostly inside gaps
+        trim_rows    important but starts late / ends early -> drop the rows it does not cover
+        drop_column  too little overlap, or weakly related to the target
+
+    Rows whose date cannot be parsed (e.g. ONS metadata rows) are ignored.
+    """
+    if date_col not in df.columns:
+        date_col = _find_date_col(df)
+    if not date_col:
+        return {"available": False, "reason": "no date column found"}
+
+    dates = _parse_dates(df[date_col])
+    ok = dates.notna().to_numpy()
+    if ok.sum() < MIN_OBS_FOR_STATS:
+        return {"available": False, "reason": f"too few parseable dates in '{date_col}'"}
+
+    body = df.loc[ok].drop(columns=[date_col])
+    raw_nn = body.notna().sum()
+    num = body.apply(pd.to_numeric, errors="coerce")
+    n_valid = num.notna().sum()
+    num = num.loc[:, (n_valid > 0) & (n_valid >= 0.5 * raw_nn)]        # numeric-like columns only
+
+    order = np.argsort(dates[ok].to_numpy(), kind="stable")             # chronological
+    num = num.iloc[order]
+    idx = pd.DatetimeIndex(dates[ok].to_numpy()[order])
+    n = len(num)
+    pos_all = np.arange(n)
+
+    t_found = target_col in num.columns
+    t_mask = num[target_col].notna().to_numpy() if t_found else np.ones(n, dtype=bool)
+    n_t = int(t_mask.sum())
+    if n_t == 0:
+        return {"available": False, "reason": f"target '{target_col}' has no valid values"}
+
+    day = lambda i: str(idx[i].date())          # noqa: E731
+    cols_out, full, drop, impute, trim = {}, [], [], [], []
+
+    for c in [c for c in num.columns if c != target_col][:MAX_COV_COLUMNS]:
+        s = num[c]
+        v = s.notna().to_numpy()
+        pos = np.flatnonzero(v)
+        overlap = int((v & t_mask).sum())
+        lost = n_t - overlap
+        if lost == 0:
+            full.append(c)
+            continue
+
+        lead = int((t_mask & (pos_all < pos[0])).sum())      # target rows before the column starts
+        trail = int((t_mask & (pos_all > pos[-1])).sum())    # target rows after the column ends
+        inside = lost - lead - trail                         # target rows in gaps inside its span
+        pct = round(100 * overlap / n_t, 1)
+
+        corr = None
+        if t_found and overlap >= MIN_OBS_FOR_STATS:
+            m = np.flatnonzero(v & t_mask)
+            r = s.iloc[m].corr(num[target_col].iloc[m])
+            corr = None if pd.isna(r) else round(float(r), 3)
+
+        if overlap < MIN_OBS_FOR_STATS or pct < COV_MIN_PCT:
+            action = "drop_column"
+        elif pct >= COV_KEEP_PCT:
+            action = "impute"
+        elif corr is not None and abs(corr) >= COV_IMPORTANT_CORR:
+            action = "trim_rows" if lead + trail >= inside else "impute"
+        else:
+            action = "drop_column"
+
+        {"drop_column": drop, "impute": impute, "trim_rows": trim}[action].append(c)
+        cols_out[c] = {
+            "first_valid": day(pos[0]), "last_valid": day(pos[-1]), "n_valid": int(len(pos)),
+            "target_overlap_pct": pct, "rows_lost_if_trimmed": lost,
+            "gap_rows_before_start": lead, "gap_rows_after_end": trail, "gap_rows_inside": inside,
+            "corr_with_target": corr, "suggested_action": action,
+        }
+
+    target_idx = np.flatnonzero(t_mask)
+    return {
+        "available": True,
+        "date_col": date_col,
+        "target_col": target_col if t_found else "",
+        "target_found": t_found,
+        "timeline": [day(0), day(n - 1), n],
+        "target_period": [day(target_idx[0]), day(target_idx[-1]), n_t],   # first, last, valid rows
+        "columns": cols_out,                    # only columns that do NOT fully cover the target period
+        "fully_covered_columns": full,
+        "drop_candidates": drop,
+        "impute_candidates": impute,
+        "trim_rows_candidates": trim,
+        "note": ("corr_with_target is computed on levels over the overlap; indicative only"
+                 + ("" if t_found else "; target not found, compared against the full timeline")),
+    }
+
+
+def attach_time_coverage(doc: dict, csv_path: str) -> dict:
+    """Add doc['time_coverage'] to the final discovery JSON (computed in code, not by the LLM)."""
+    try:
+        df = _load_dataframe(csv_path)
+        date_col = ((doc.get("column_classification") or {}).get("date_columns") or [""])[0]
+        tgt = doc.get("target") or {}
+        target_col = tgt.get("target_col", "")
+        if target_col not in df.columns:         # derived target -> use the source column named in its description
+            desc = (tgt.get("derivation_description") or "").lower()
+            matches = [str(c) for c in df.columns if str(c).lower() in desc]
+            target_col = max(matches, key=len) if matches else ""
+        doc["time_coverage"] = _coverage_analysis(df, date_col, target_col)
+    except Exception as exc:  # noqa: BLE001
+        doc["time_coverage"] = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+    return doc
+
+
 # --------------------------------------------------------------------------- #
 # Tool 1 -- Read data
 # --------------------------------------------------------------------------- #
@@ -218,7 +359,7 @@ def read_data_tool(csv_path: str, prompt: str) -> str:
     NO transformations, feature engineering or target derivation happen here.
 
     Use this tool FIRST, then classify every column as target, feature,
-    date, id or irrelevant, and infer the data frequency.
+    date, id or irrelevant, and infer the data frequency(daily/).
     """
     head = _load_dataframe(csv_path, nrows=10)
     all_cols = head.columns.tolist()
@@ -259,9 +400,12 @@ def read_data_tool(csv_path: str, prompt: str) -> str:
 # --------------------------------------------------------------------------- #
 
 @tool
-def data_quality_tool(csv_path: str) -> str:
+def data_quality_tool(csv_path: str, target_col: str = "", date_col: str = "") -> str:
     """
     Inspect data quality of the dataset.
+
+    Pass target_col and date_col from your read_data_tool classification. If the target
+    must be derived, pass the raw column it is derived from.
 
     Returns, per column:
       - missing count and percentage
@@ -270,8 +414,11 @@ def data_quality_tool(csv_path: str) -> str:
     Plus dataset-level: duplicate row count, constant columns, and a
     suggested fill strategy per column with missing values.
 
-    The agent uses this to decide which columns to drop, which to impute,
-    and with which statistic (mean / median / mode / forward-fill).
+    Also returns `time_coverage`: how each column's date range compares with the
+    target's. Columns that do not fully cover the target period are listed with
+    first/last valid date, target_overlap_pct, rows_lost_if_trimmed, corr_with_target and a
+    suggested_action (impute | trim_rows | drop_column). Use drop_candidates for
+    columns_to_drop and impute_candidates for columns_to_fill.
     """
     df = _load_dataframe(csv_path)
     n_rows = len(df)
@@ -324,6 +471,11 @@ def data_quality_tool(csv_path: str) -> str:
         if c not in numeric_cols and df[c].nunique(dropna=True) > 50
     ]
 
+    try:
+        time_coverage = _coverage_analysis(df, date_col.strip(), target_col.strip())
+    except Exception as exc:  # noqa: BLE001
+        time_coverage = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
     return _dumps({
         "n_rows": n_rows,
         "n_columns": int(df.shape[1]),
@@ -337,22 +489,22 @@ def data_quality_tool(csv_path: str) -> str:
             c for c, st in stats.items()
             if (st.get("iqr_outliers") or 0) > 0 or (st.get("zscore_outliers") or 0) > 0
         ],
+        "time_coverage": time_coverage,
     })
 
 
 # --------------------------------------------------------------------------- #
 # Tool 3 -- Stationarity check
 # --------------------------------------------------------------------------- #
-
 @tool
-def stationarity_tool(csv_path: str, columns: str = "") -> str:
+def stationarity_tool(csv_path: str, columns: Union[str, list[str]] = "") -> str:
     """
     Test every numeric column for stationarity using the Augmented
     Dickey-Fuller (ADF) test.
 
-    `columns` is an optional comma-separated list (e.g. "cpiret,gdp_growth")
-    to restrict the test; leave empty to test all numeric columns
-    (capped for very wide datasets).
+    `columns` is an optional comma-separated string (e.g. "cpiret,gdp_growth")
+    or a list of column names to restrict the test; leave empty to test all
+    numeric columns (capped for very wide datasets).
 
     A column is reported stationary when the ADF p-value < 0.05.
 
@@ -360,12 +512,17 @@ def stationarity_tool(csv_path: str, columns: str = "") -> str:
     number of lags used, plus a list of non-stationary columns so the
     agent can decide whether differencing is required.
     """
-    from statsmodels.tsa.stattools import adfuller
-
     df = _load_dataframe(csv_path)
 
-    if columns.strip():
-        targets = [c.strip() for c in columns.split(",") if c.strip() in df.columns]
+    # Normalise: accept "a,b" or ["a", "b"]
+    if isinstance(columns, list):
+        requested = [str(c).strip() for c in columns]
+    else:
+        requested = [c.strip() for c in (columns or "").split(",")]
+    requested = [c for c in requested if c]
+
+    if requested:
+        targets = [c for c in requested if c in df.columns]
         if not targets:
             return _dumps({"error": "None of the requested columns exist in the dataset"})
     else:
@@ -480,29 +637,42 @@ def correlation_tool(csv_path: str, target_col: str = "") -> str:
 
     return _dumps(result)
 
-
+ 
 # --------------------------------------------------------------------------- #
 # Prompt
 # --------------------------------------------------------------------------- #
-
+ 
 DISCOVERY_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """
+{guidance}
+
 You are a dataset discovery agent for financial time-series forecasting.
 Your job is to fully characterise a dataset so a downstream preprocessing
-agent can decide exactly which operations to apply. You NEVER transform,
-impute, engineer features or fit models yourself -- you only inspect and report.
-
+agent can decide exactly which operations to apply. Your role is to only inspect and report.
+ 
+TOOL-CALLING RULES
+- Every reply MUST be a real tool call. Never write a tool call as text or JSON.
+- Call each of the four tools once, in the order below, using exact column names
+  taken from earlier tool results. Pass list arguments as comma-separated strings.
+- Do NOT write the final report until all four tools have returned results. After each
+  tool result, immediately call the next tool. The final answer is the report JSON below.
+ 
 Workflow (call the tools in this order):
 1. read_data_tool(csv_path, prompt) -- get columns, dtypes, sample rows,
    heuristic date/id hints. Classify every column.
-2. data_quality_tool(csv_path) -- missing values, central tendency/outliers.
-   Decide which columns to drop and how to fill the rest.
+2. data_quality_tool(csv_path, target_col, date_col) -- missing values, outliers and
+   time coverage. Pass the target column (if the target must be derived, pass the raw
+   column it is derived from) and the date column from step 1.
+   Put time_coverage.drop_candidates into columns_to_drop and
+   time_coverage.impute_candidates into columns_to_fill. Mention
+   time_coverage.trim_rows_candidates in data_quality.notes. Do NOT copy the rest of
+   time_coverage into your answer; the system attaches it.
 3. stationarity_tool(csv_path, columns) -- ADF test. Decide whether
    differencing is needed. Pass the target and the main feature columns
    when the dataset is very wide.
 4. correlation_tool(csv_path, target_col) -- find important features,
    redundant/multicollinear columns and weak predictors.
-
+ 
 Column classification rules:
 - target            : the ONE column (or derived series) named by the user goal.
                       If it must be derived (e.g. volatility from Close,
@@ -512,13 +682,12 @@ Column classification rules:
 - date_columns      : date/time columns -- never used as features.
 - id_columns        : identifiers / row indices -- never used as features.
 - irrelevant_columns: everything else to discard.
-
-Frequency must be one of: daily, weekly, biweekly, monthly, quarterly,
-yearly, unknown. Infer it from the date column spacing, NOT from row count.
-
+ 
+Infer the temporal frequency from the date column spacing, NOT from row count.
+ 
 When done, return ONLY a JSON object inside a ```json ... ``` block with
 exactly this structure:
-
+ 
 {{
   "csv_path": "original dataset path",
   "user_goal": "the user's prediction prompt, verbatim",
@@ -556,81 +725,198 @@ exactly this structure:
   }},
   "notes": "anything else the preprocessing agent must know"
 }}
-
-Rules for the final answer:
-- Use ONLY column names that appear in the tool output.
-- Never invent statistics; if a tool failed, say so in "notes".
-- Output the JSON block and nothing else after it.
+ 
 """),
-    ("human", "Dataset path: {csv_path}\nUser prediction goal: {prompt}"),
+    ("human", "Dataset path: {csv_path}\nUser prediction goal: {prompt}\n\n{knowledge}\n"
+     "Call read_data_tool now. After each result call the next: data_quality_tool, stationarity_tool, correlation_tool."),
     ("placeholder", "{agent_scratchpad}"),
-])
-
-
+]).partial(guidance=load_guidance("discovery"))
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
-
+ 
 DISCOVERY_TOOLS = [
     read_data_tool,
     data_quality_tool,
     stationarity_tool,
     correlation_tool,
 ]
-
-
+ 
+# A badly-typed tool argument is returned to the model as an observation (it can retry)
+# instead of crashing the run.
+for _t in DISCOVERY_TOOLS:
+    try:
+        _t.handle_validation_error = True
+    except Exception:  # noqa: BLE001
+        pass
+ 
+ 
 def build_discovery_agent(temperature: float = 0) -> AgentExecutor:
     """Build the tool-calling discovery agent."""
-    agent_llm = ChatOllama(model=MODEL, temperature=temperature)
+    agent_llm = build_chat_model(temperature)
     agent = create_tool_calling_agent(agent_llm, DISCOVERY_TOOLS, DISCOVERY_PROMPT)
     return AgentExecutor(
         agent=agent,
         tools=DISCOVERY_TOOLS,
         verbose=True,
         return_intermediate_steps=True,
-        max_iterations=10,
+        max_iterations=12,
         handle_parsing_errors=True,
     )
-
-
+ 
+ 
 DISCOVERY_AGENT = build_discovery_agent()
-
-
+ 
+ 
+# --------------------------------------------------------------------------- #
+# Output validation + fallback
+# --------------------------------------------------------------------------- #
+ 
+REQUIRED_KEYS = ("target", "frequency", "column_classification",
+                 "data_quality", "stationarity", "correlation")
+ 
+ 
+def _is_valid_discovery(doc) -> bool:
+    """A real report has every section. A stray tool call like {"name": ...} does not."""
+    return (isinstance(doc, dict)
+            and all(k in doc for k in REQUIRED_KEYS)
+            and isinstance(doc["target"], dict)
+            and bool(doc["target"].get("target_col")))
+ 
+ 
 def extract_discovery_json(text: str) -> dict:
-    """Pull the JSON object out of the agent's final answer."""
+    """Pull the VALID discovery report out of the answer (raises ValueError if none)."""
     import re
-
+ 
     fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidates = fenced if fenced else []
+    candidates = list(fenced)
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidates.append(text[start:end + 1])
-
+ 
     for block in reversed(candidates):
         try:
-            return json.loads(block)
+            doc = json.loads(block)
         except json.JSONDecodeError:
             continue
-    raise ValueError(f"Discovery agent did not return valid JSON:\n{text}")
-
-
-def run_discovery_agent(csv_path: str, prompt: str) -> dict:
+        if _is_valid_discovery(doc):
+            return doc
+    raise ValueError(f"No valid discovery report found in:\n{text[:500]}")
+ 
+ 
+def _drop_unknown_columns(doc: dict, valid: set) -> dict:
+    """Remove column names that do not exist in the dataset (guards against hallucination)."""
+    def clean(x):
+        if isinstance(x, list):
+            return [c for c in x if c in valid]
+        if isinstance(x, dict):
+            return {k: v for k, v in x.items() if k in valid}
+        return x
+ 
+    for section in ("column_classification", "data_quality", "stationarity", "correlation"):
+        sec = doc.get(section)
+        if isinstance(sec, dict):
+            for key, val in sec.items():
+                if isinstance(val, (list, dict)):
+                    sec[key] = clean(val)
+    return doc
+ 
+ 
+def _compact_for_llm(name: str, obs, limit: int = 6000) -> str:
+    """Shrink tool outputs so all four fit comfortably in the context window."""
+    obs = str(obs)
+    try:
+        d = json.loads(obs)
+        if name == "data_quality_tool":
+            d.pop("numeric_stats", None)
+            tc = d.pop("time_coverage", None) or {}
+            d["time_coverage_summary"] = {k: tc.get(k) for k in
+                                          ("target_period", "drop_candidates",
+                                           "impute_candidates", "trim_rows_candidates")}
+        elif name == "stationarity_tool":
+            d.pop("results", None)
+        obs = json.dumps(d, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+    return obs[:limit]
+ 
+ 
+def _synthesize_discovery(csv_path: str, prompt: str, knowledge: str, outputs: dict) -> dict:
     """
-    Run the discovery agent and return the parsed JSON hand-off document.
-
-    This is the function orchestrator_agent.py calls.
+    Fallback when the agent loop did not produce a valid report: run any tool that has no
+    result yet (in code), then ask the LLM -- with NO tools bound, so it cannot emit a
+    tool call -- to write the report from the tool outputs.
     """
-    result = DISCOVERY_AGENT.invoke({"csv_path": csv_path, "prompt": prompt})
-    return extract_discovery_json(result["output"])
-
-
+    llm = build_chat_model()
+    tools = {t.name: t for t in DISCOVERY_TOOLS}
+ 
+    if "read_data_tool" not in outputs:
+        outputs["read_data_tool"] = tools["read_data_tool"].invoke({"csv_path": csv_path, "prompt": prompt})
+    read = json.loads(outputs["read_data_tool"])
+    cols = read.get("all_columns", [])
+    date_col = (read.get("heuristic_date_columns") or [""])[0]
+ 
+    pick = llm.invoke(
+        f"Columns: {cols}\nGoal: {prompt}\n"
+        "Which ONE column is the target (or the raw column the target is derived from)? "
+        "Reply with exactly one column name from the list and nothing else."
+    ).content.strip().strip("'\"` ")
+    target = next((c for c in cols if c.lower() == pick.lower()), "")
+ 
+    if "data_quality_tool" not in outputs:
+        outputs["data_quality_tool"] = tools["data_quality_tool"].invoke(
+            {"csv_path": csv_path, "target_col": target, "date_col": date_col})
+    if "stationarity_tool" not in outputs:
+        outputs["stationarity_tool"] = tools["stationarity_tool"].invoke({"csv_path": csv_path, "columns": ""})
+    if "correlation_tool" not in outputs:
+        outputs["correlation_tool"] = tools["correlation_tool"].invoke({"csv_path": csv_path, "target_col": target})
+ 
+    human = (
+        "The four tools have ALREADY been run. Do NOT call tools. Using only the outputs below, "
+        "write the final report JSON described in your instructions, inside a ```json block.\n\n"
+        f"Dataset path: {csv_path}\nUser prediction goal: {prompt}\n{knowledge}\n\n"
+        + "\n\n".join(f"{name} output:\n{_compact_for_llm(name, outputs[name])}"
+                      for name in ("read_data_tool", "data_quality_tool",
+                                   "stationarity_tool", "correlation_tool"))
+    )
+    system_text = DISCOVERY_PROMPT.messages[0].format(guidance=load_guidance("discovery")).content      # prompt text with {{ }} unescaped
+    return extract_discovery_json(llm.invoke([("system", system_text), ("human", human)]).content)
+ 
+ 
+def run_discovery_agent(csv_path: str, prompt: str, run_id: str = None) -> dict:
+    """Run the discovery agent and return the validated hand-off JSON (with time_coverage)."""
+    out_dir = get_run_dir(run_id) if run_id else create_run_dir()
+    knowledge = get_knowledge("discovery", [prompt, Path(csv_path).stem])
+    result = DISCOVERY_AGENT.invoke({"csv_path": csv_path, "prompt": prompt, "knowledge": knowledge})
+ 
+    outputs = {a.tool: str(o) for a, o in result.get("intermediate_steps", [])
+               if str(o).startswith("{") and not str(o).startswith('{"error"')}   # successful calls only
+    try:   # an answer written without all four tool results is rejected ("" raises ValueError)
+        doc = extract_discovery_json(result["output"] if len(outputs) == len(DISCOVERY_TOOLS) else "")
+    except ValueError:
+        print(f"[warn] Agent answer was not a valid report (tools called: {sorted(outputs) or 'none'}); "
+              "building the report from the tool outputs instead.")
+        doc = _synthesize_discovery(csv_path, prompt, knowledge, outputs)
+ 
+    try:
+        valid = set(map(str, _load_dataframe(csv_path, nrows=1).columns))
+        doc = _drop_unknown_columns(doc, valid)
+    except Exception:  # noqa: BLE001
+        pass
+    doc.setdefault("csv_path", csv_path)
+    doc.setdefault("user_goal", prompt)
+    doc = attach_time_coverage(doc, csv_path)
+    doc["run_id"] = out_dir.name
+    (out_dir / "discovery.json").write_text(
+        json.dumps(doc, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+    return doc
+ 
+ 
 if __name__ == "__main__":
-    import sys
+    test_dataset = r"D:\Internship\Fintech-agent\temp\sample input data\UK_GDP_Dataset.csv"
+    test_prompt = "predict GDP for next quarter with the given dataset"
 
-    path = sys.argv[1] if len(sys.argv) > 1 else "D:/Internship/Fintech-agent/temp/sample input data/GDP.csv"
-    goal = sys.argv[2] if len(sys.argv) > 2 else "forecast GDP from the dataset attached"
-
-    discovery = run_discovery_agent(path, goal)
-    with open("D:/Internship/Fintech-agent/results/discovery/discovery_1001.json", "w", encoding="utf-8") as f:
-        json.dump(discovery, f, indent=2, ensure_ascii=False)
-    print("Discovery agent completed, json saved!")
+    result = run_discovery_agent(test_dataset, test_prompt)
+    print(json.dumps(result, indent=2, ensure_ascii=False))

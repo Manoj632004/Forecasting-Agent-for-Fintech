@@ -26,15 +26,25 @@
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2v-2a2 2 0 00-2-2H5a2 2 0 00-2 2v2z" />
                 </svg>
-                <span>My Forecasts</span>
+                <span>Forecasts</span>
+                <svg class="forecast-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="width: 16px; height: 16px; margin-left: auto; transition: transform 0.2s ease;">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                </svg>
             </button>
+            <div class="forecast-list" id="forecastList">
+                <!-- Forecast items will be populated here dynamically -->
+            </div>
             <!-- Future menu buttons can go here -->
         </nav>
     </aside>
 
     <!-- Center Area (Empty) -->
-    <main class="center-area">
+    <!-- <main class="center-area">
         <div class="center-placeholder">Content area</div>
+    </main> -->
+    <main class="center-area" id="centerArea">
+    <div class="center-placeholder" id="centerPlaceholder">Content area</div>
+        <iframe id="reportFrame" class="report-frame" title="Forecast report"></iframe>
     </main>
 
     <!-- Right Chat Panel -->

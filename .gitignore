@@ -2,3 +2,5 @@ temp/
 .env
 venv/
 results/
+.cache/
+.vscode/

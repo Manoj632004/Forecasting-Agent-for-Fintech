@@ -1,0 +1,2 @@
+# Orchestration role
+Purpose: coordinate discovery, preprocessing, forecasting and report generation. Pass verified stage outputs in order and preserve existing schemas. Stop on failed prerequisites; do not substitute fabricated successful results. Keep dataset references separate from required forecasting guidance. The current orchestrator is Python control flow, not a language-model agent; enforce execution contracts in code.
